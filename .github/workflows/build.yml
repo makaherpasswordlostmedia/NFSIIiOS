@@ -1,0 +1,278 @@
+name: NFS2 SE -> iOS 7 (armv7) IPA
+
+# ONE-FILE BUILD. Put this file at  .github/workflows/build.yml  in an empty GitHub repo,
+# then Actions -> "NFS2 SE -> iOS 7 (armv7) IPA" -> Run workflow. The IPA appears as an artifact.
+# Everything else (wrapper, C++ game translation, SDL2, iOS SDK, patches, touch overlay,
+# Info.plist) is downloaded or generated below. Cross-compiled on Linux (clang + lld),
+# because current macOS runners / Xcode cannot link 32-bit armv7 any more.
+# STATUS: written without being able to run it. Expect to fix a first error or two.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/build.yml"]
+
+env:
+  SDL_TAG: release-2.30.9      # needs >= 2.24 (SDL_JoystickPathForIndex)
+  IOS_MIN: "7.0"
+  LLVM: "15"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-$LLVM lld-$LLVM llvm-$LLVM cmake ninja-build zip python3 git
+          sudo apt-get install -y ldid || echo "ldid not available, IPA will be unsigned"
+          echo "/usr/lib/llvm-$LLVM/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch sources (wrapper + C++ translation, SDL2, iOS SDK)
+        run: |
+          git clone --recursive --depth 1 https://github.com/zaps166/NFSIISE wrapper
+          test -s wrapper/src/Cpp/NFS2SE.cpp
+          git clone --depth 1 --branch "$SDL_TAG" https://github.com/libsdl-org/SDL sdl
+          git clone --depth 1 https://github.com/theos/sdks theos-sdks
+          ls theos-sdks
+          SDK=$(ls -d theos-sdks/iPhoneOS9.3.sdk theos-sdks/iPhoneOS10.3.sdk theos-sdks/iPhoneOS10.*.sdk theos-sdks/iPhoneOS11.*.sdk 2>/dev/null | head -n1)
+          echo "Using SDK: $SDK"
+          echo "SDK=$GITHUB_WORKSPACE/$SDK" >> "$GITHUB_ENV"
+
+      - name: Patch wrapper for iOS
+        working-directory: wrapper/src
+        run: |
+          mkdir -p ../../compat
+          cat > ../../compat/byteswap.h <<'EOF'
+          #ifndef IOS_COMPAT_BYTESWAP_H
+          #define IOS_COMPAT_BYTESWAP_H
+          #define bswap_16(x) __builtin_bswap16(x)
+          #define bswap_32(x) __builtin_bswap32(x)
+          #define bswap_64(x) __builtin_bswap64(x)
+          #endif
+          EOF
+          cat > ../../compat/ios_compat.h <<'EOF'
+          #ifndef IOS_COMPAT_H
+          #define IOS_COMPAT_H
+          #ifndef __LITTLE_ENDIAN
+          #define __LITTLE_ENDIAN 1234
+          #endif
+          #ifndef __BYTE_ORDER
+          #define __BYTE_ORDER __LITTLE_ENDIAN
+          #endif
+          #ifndef __WORDSIZE
+          #define __WORDSIZE 32
+          #endif
+          #endif
+          EOF
+          python3 - <<'PY'
+          def patch(path, pairs):
+              s = open(path).read()
+              for old, new in pairs:
+                  assert old in s, "patch anchor not found in %s: %r" % (path, old)
+                  s = s.replace(old, new, 1)
+              open(path, "w").write(s)
+
+          patch("Wrapper.c", [
+            ('SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");',
+             '\n#ifdef IOS_BUILD\n\tSDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");\n'
+             '\tSDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "1");\n'
+             '\tSDL_SetHint(SDL_HINT_IDLE_TIMER_DISABLED, "1");\n#endif\n'
+             '\tSDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");'),
+            ('#if defined(WIN32)\n\tconst char *homeDir = getenv("AppData");',
+             '#ifdef IOS_BUILD\n\t{\n\t\tconst char *home = getenv("HOME");\n\t\tif (home && *home)\n\t\t{\n'
+             '\t\t\tchar *docs = malloc(strlen(home) + 32);\n'
+             '\t\t\tsprintf(docs, "%s/Documents/nfs2se_data", home);\n'
+             '\t\t\tmkdir_wrap(docs, 0755);\n'
+             '\t\t\tif (chdir(docs))\n\t\t\t\tperror("chdir Documents");\n'
+             '\t\t\tfree(docs);\n\t\t}\n\t}\n#endif\n'
+             '#if defined(WIN32)\n\tconst char *homeDir = getenv("AppData");'),
+            ('windowFlags |= SDL_WINDOW_RESIZABLE;',
+             'windowFlags |= SDL_WINDOW_RESIZABLE;\n#ifdef IOS_BUILD\n'
+             '\twindowFlags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS;\n#endif'),
+            ('wndProc = windowProc;',
+             'wndProc = windowProc;\n#ifdef IOS_BUILD\n\t{\n\t\textern void iosOverlayInstall(SDL_Window *win);\n'
+             '\t\tiosOverlayInstall(sdlWin);\n\t}\n#endif'),
+            ('#ifdef __ANDROID__\n\t\t\telse if (!strncasecmp("AccelerometerAsJoystick="',
+             '#if defined(__ANDROID__) || defined(IOS_BUILD)\n\t\t\telse if (!strncasecmp("AccelerometerAsJoystick="'),
+          ])
+          patch("DInput.c", [
+            ('#ifdef __ANDROID__\n\t\t\tif (n > 1 && name && strcmp(name, "Android Accelerometer") == 0)',
+             '#if defined(__ANDROID__) || defined(IOS_BUILD)\n\t\t\tif (n > 1 && name && (strcmp(name, "Android Accelerometer") == 0 || strcmp(name, "iOS Accelerometer") == 0))'),
+          ])
+          # iOS: the "default framebuffer" is SDL's own FBO, not 0 (binding 0 = black screen)
+          patch("Glide2x/OpenGL2.c", [
+            ('const char g_vShaderSrc[] =',
+             '#ifdef IOS_BUILD\n# include <SDL2/SDL_syswm.h>\nextern SDL_Window *sdlWin;\n'
+             'static GLuint iosDefaultFramebuffer(void)\n{\n\tstatic GLuint fb;\n\tstatic int got;\n'
+             '\tif (!got)\n\t{\n\t\tSDL_SysWMinfo i;\n\t\tSDL_VERSION(&i.version);\n'
+             '\t\tif (SDL_GetWindowWMInfo(sdlWin, &i))\n\t\t\tfb = i.info.uikit.framebuffer;\n\t\tgot = 1;\n\t}\n\treturn fb;\n}\n'
+             '# define DEFAULT_FB iosDefaultFramebuffer()\n#else\n# define DEFAULT_FB 0\n#endif\n\n'
+             'const char g_vShaderSrc[] ='),
+            ('glBindFramebuffer(GL_FRAMEBUFFER, 0);', 'glBindFramebuffer(GL_FRAMEBUFFER, DEFAULT_FB);'),
+          ])
+          print("patches applied")
+          PY
+
+      - name: Write touch overlay (UIKit buttons -> SDL key events)
+        run: |
+          cat > wrapper/src/IOSOverlay.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #include <SDL2/SDL.h>
+          #include <SDL2/SDL_syswm.h>
+
+          typedef struct { const char *label; SDL_Keycode sym; SDL_Scancode sc; CGFloat x, y, w, h; } Btn;
+          static const Btn kButtons[] = {
+            {"<",   SDLK_LEFT,   SDL_SCANCODE_LEFT,   0.02, 0.70, 0.11, 0.26},
+            {">",   SDLK_RIGHT,  SDL_SCANCODE_RIGHT,  0.14, 0.70, 0.11, 0.26},
+            {"GAS", SDLK_UP,     SDL_SCANCODE_UP,     0.87, 0.58, 0.11, 0.18},
+            {"BRK", SDLK_DOWN,   SDL_SCANCODE_DOWN,   0.87, 0.78, 0.11, 0.18},
+            {"HB",  SDLK_SPACE,  SDL_SCANCODE_SPACE,  0.74, 0.78, 0.11, 0.18},
+            {"UP",  SDLK_a,      SDL_SCANCODE_A,      0.74, 0.58, 0.11, 0.18},
+            {"DN",  SDLK_z,      SDL_SCANCODE_Z,      0.62, 0.78, 0.11, 0.18},
+            {"CAM", SDLK_c,      SDL_SCANCODE_C,      0.62, 0.58, 0.11, 0.18},
+            {"ESC", SDLK_ESCAPE, SDL_SCANCODE_ESCAPE, 0.90, 0.02, 0.08, 0.12},
+            {"OK",  SDLK_RETURN, SDL_SCANCODE_RETURN, 0.80, 0.02, 0.08, 0.12},
+          };
+          #define NBTN (sizeof(kButtons)/sizeof(kButtons[0]))
+
+          static void pushKey(const Btn *b, int down) {
+            SDL_Event e; SDL_zero(e);
+            e.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+            e.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+            e.key.keysym.sym = b->sym;
+            e.key.keysym.scancode = b->sc;
+            SDL_PushEvent(&e);
+          }
+
+          @interface NFSKeyButton : UIButton
+          @property (nonatomic) const Btn *btn;
+          @end
+          @implementation NFSKeyButton
+          - (void)down { pushKey(self.btn, 1); self.alpha = 0.85; }
+          - (void)up   { pushKey(self.btn, 0); self.alpha = 0.40; }
+          @end
+
+          static NSMutableArray *g_buttons;
+          @interface NFSToggle : NSObject
+          + (void)toggle:(UIButton *)sender;
+          @end
+          @implementation NFSToggle
+          + (void)toggle:(UIButton *)sender {
+            BOOL hide = !((UIView *)g_buttons[0]).hidden;
+            for (UIView *v in g_buttons) v.hidden = hide;
+            sender.alpha = hide ? 0.25 : 0.5;
+          }
+          @end
+
+          void iosOverlayInstall(SDL_Window *win) {
+            SDL_SysWMinfo info; SDL_VERSION(&info.version);
+            if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_UIKIT) return;
+            UIWindow *w = info.info.uikit.window;
+            UIView *root = w.rootViewController ? w.rootViewController.view : w;
+            CGRect r = root.bounds;
+            g_buttons = [NSMutableArray array];
+            for (size_t i = 0; i < NBTN; ++i) {
+              NFSKeyButton *b = [NFSKeyButton buttonWithType:UIButtonTypeCustom];
+              b.btn = &kButtons[i];
+              b.frame = CGRectMake(r.size.width * kButtons[i].x, r.size.height * kButtons[i].y,
+                                   r.size.width * kButtons[i].w, r.size.height * kButtons[i].h);
+              b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                                   UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin |
+                                   UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              b.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1];
+              b.layer.cornerRadius = 10; b.alpha = 0.40; b.multipleTouchEnabled = YES;
+              [b setTitle:[NSString stringWithUTF8String:kButtons[i].label] forState:UIControlStateNormal];
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+              [b addTarget:b action:@selector(down) forControlEvents:UIControlEventTouchDown];
+              [b addTarget:b action:@selector(up) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+              [root addSubview:b]; [g_buttons addObject:b];
+            }
+            UIButton *t = [UIButton buttonWithType:UIButtonTypeCustom];
+            t.frame = CGRectMake(8, 8, 44, 32); t.alpha = 0.5; t.layer.cornerRadius = 8;
+            t.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1];
+            [t setTitle:@"PAD" forState:UIControlStateNormal]; t.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+            [t addTarget:[NFSToggle class] action:@selector(toggle:) forControlEvents:UIControlEventTouchUpInside];
+            [root addSubview:t];
+          }
+          EOF
+
+      - name: Build SDL2 (static, armv7, iOS)
+        run: |
+          cat > ios.toolchain.cmake <<EOF
+          set(CMAKE_SYSTEM_NAME iOS)
+          set(CMAKE_OSX_ARCHITECTURES armv7)
+          set(CMAKE_OSX_SYSROOT $SDK)
+          set(CMAKE_OSX_DEPLOYMENT_TARGET $IOS_MIN)
+          set(CMAKE_C_COMPILER clang)
+          set(CMAKE_CXX_COMPILER clang++)
+          set(CMAKE_OBJC_COMPILER clang)
+          set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fuse-ld=lld")
+          set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fobjc-arc")
+          set(CMAKE_LIBTOOL /usr/lib/llvm-$LLVM/bin/llvm-libtool-darwin)
+          set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+          EOF
+          cmake -S sdl -B sdl-build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/ios.toolchain.cmake \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DSDL_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX=$PWD/sdl-out -DCMAKE_BUILD_TYPE=Release
+          cmake --build sdl-build
+          cmake --install sdl-build
+          ls sdl-out/lib sdl-out/include/SDL2 | head
+
+      - name: Compile game
+        working-directory: wrapper/src
+        run: |
+          set -e
+          OUT=$GITHUB_WORKSPACE/obj; mkdir -p $OUT
+          T="-target armv7-apple-ios$IOS_MIN -isysroot $SDK -O3 -DNDEBUG -I$GITHUB_WORKSPACE/sdl-out/include -I$GITHUB_WORKSPACE/compat"
+          echo "== C++ (translated game)"
+          clang++ $T -std=c++14 -stdlib=libc++ -fno-rtti -fno-exceptions -Wno-c++11-narrowing \
+            -include $GITHUB_WORKSPACE/compat/ios_compat.h -c Cpp/NFS2SE.cpp -o $OUT/NFS2SE.o
+          for f in DInput EAcsnd FetchTrackRecords Glide2x Kernel32 Timer User32 WinMM Wrapper Wsock32; do
+            echo "== C $f"
+            clang $T -std=gnu89 -DGLES2 -DNFS_CPP -DIOS_BUILD -Wno-int-conversion \
+              -Wno-incompatible-function-pointer-types -c $f.c -o $OUT/$f.o
+          done
+          echo "== ObjC overlay"
+          clang $T -std=gnu99 -fobjc-arc -DIOS_BUILD -x objective-c -c IOSOverlay.m -o $OUT/IOSOverlay.o
+          echo "== link"
+          clang++ -target armv7-apple-ios$IOS_MIN -isysroot $SDK -stdlib=libc++ -fuse-ld=lld \
+            -o $OUT/nfs2se $OUT/*.o $GITHUB_WORKSPACE/sdl-out/lib/libSDL2.a \
+            -framework UIKit -framework Foundation -framework OpenGLES -framework QuartzCore \
+            -framework CoreGraphics -framework AudioToolbox -framework CoreAudio -framework AVFoundation \
+            -framework CoreMotion -framework GameController -framework CoreFoundation \
+            -framework ImageIO -framework MobileCoreServices -lm -liconv
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload/NFS2SE.app
+          cp obj/nfs2se Payload/NFS2SE.app/nfs2se
+          cat > Payload/NFS2SE.app/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>NFS II SE</string>
+            <key>CFBundleDisplayName</key><string>NFS II SE</string>
+            <key>CFBundleIdentifier</key><string>org.example.nfs2se</string>
+            <key>CFBundleExecutable</key><string>nfs2se</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>MinimumOSVersion</key><string>7.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+            <key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
+            <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+            <key>UIFileSharingEnabled</key><true/>
+            <key>UIStatusBarHidden</key><true/>
+            <key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          </dict></plist>
+          EOF
+          cp "wrapper/Need For Speed II SE/nfs2se.conf.template" Payload/NFS2SE.app/ 2>/dev/null || true
+          if command -v ldid >/dev/null; then ldid -S Payload/NFS2SE.app/nfs2se; fi
+          zip -qr NFS2SE.ipa Payload
+          ls -la NFS2SE.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NFS2SE-ios7-armv7
+          path: NFS2SE.ipa

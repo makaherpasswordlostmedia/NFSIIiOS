@@ -237,6 +237,11 @@ jobs:
 
       - name: Build SDL2 (static, armv7, iOS)
         run: |
+          # cctools "ar" shells out to <triple>-ranlib, which this toolchain does not ship
+          B="$THEOS/toolchain/linux/iphone/bin"
+          ls "$B" | grep -E "^(llvm-ar|llvm-ranlib|ranlib|ar)$"
+          ln -sf "$B/ranlib" "$B/aarch64-apple-darwin14-ranlib" || true
+          ln -sf "$B/ranlib" "$B/arm-apple-darwin11-ranlib" || true
           for t in clang clang++ ld install_name_tool libtool lipo otool; do
             printf '%-18s' "$t"; command -v $t || echo "MISSING"
           done
@@ -250,6 +255,8 @@ jobs:
           set(CMAKE_OBJC_COMPILER clang)
           set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules")
           set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fobjc-arc")
+          set(CMAKE_AR $THEOS/toolchain/linux/iphone/bin/llvm-ar CACHE FILEPATH "")
+          set(CMAKE_RANLIB $THEOS/toolchain/linux/iphone/bin/llvm-ranlib CACHE FILEPATH "")
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
           cmake -S sdl -B sdl-build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/ios.toolchain.cmake \

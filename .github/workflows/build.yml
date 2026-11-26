@@ -1,43 +1,81 @@
 name: NFS2 SE -> iOS 7 (armv7) IPA
 
 # ONE-FILE BUILD. Put this file at  .github/workflows/build.yml  in an empty GitHub repo,
-# then Actions -> "NFS2 SE -> iOS 7 (armv7) IPA" -> Run workflow. The IPA appears as an artifact.
-# Everything else (wrapper, C++ game translation, SDL2, iOS SDK, patches, touch overlay,
-# Info.plist) is downloaded or generated below. Cross-compiled on Linux (clang + lld),
-# because current macOS runners / Xcode cannot link 32-bit armv7 any more.
-# STATUS: written without being able to run it. Expect to fix a first error or two.
+# then Actions -> run it. The IPA appears as an artifact.
+# Toolchain/SDK/libc++ handling is copied from the working BStone iOS 7 workflow:
+# Theos-style LLVM toolchain (L1ghtmann) + iPhoneOS 9.3 SDK, module maps removed,
+# libc++ headers taken from the SDK (iOS 7 libc++.dylib), -arm-assume-misaligned-load-store.
+# STATUS: not run by me. Biggest open risk: SDL2 on iOS 7 (the BStone port dropped SDL on iOS).
 
 on:
   workflow_dispatch:
   push:
     paths: [".github/workflows/build.yml"]
 
-env:
-  SDL_TAG: release-2.30.9      # needs >= 2.24 (SDL_JoystickPathForIndex)
-  IOS_MIN: "7.0"
-  LLVM: "15"
-
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      SDL_TAG: release-2.30.9      # needs >= 2.24 (SDL_JoystickPathForIndex)
+      IOS_MIN: "7.0"
     steps:
-      - name: Install toolchain
+      - name: Install host tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-$LLVM lld-$LLVM llvm-$LLVM cmake ninja-build zip python3 git
-          sudo apt-get install -y ldid || echo "ldid not available, IPA will be unsigned"
-          echo "/usr/lib/llvm-$LLVM/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y build-essential perl curl ca-certificates zip unzip xz-utils bzip2 git make patch python3 cmake ninja-build
 
-      - name: Fetch sources (wrapper + C++ translation, SDL2, iOS SDK)
+      - name: Install iOS cross toolchain
+        run: |
+          mkdir -p "$THEOS/toolchain"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/ios-toolchain.tar.xz
+          tar -xf /tmp/ios-toolchain.tar.xz -C "$THEOS/toolchain"
+          echo "$THEOS/toolchain/linux/iphone/bin" >> "$GITHUB_PATH"
+          ls "$THEOS/toolchain/linux/iphone/bin"
+
+      - name: Install iPhoneOS 9.3 SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/iphoneos9.3.sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/iphoneos9.3.sdk.tbz2 -C "$THEOS/sdks"
+          ls "$THEOS/sdks"
+          echo "SDK=$THEOS/sdks/iPhoneOS9.3.sdk" >> "$GITHUB_ENV"
+
+      - name: Remove clang module maps (SDK + toolchain)
+        run: |
+          # old SDK / toolchain module maps do not match this clang -> plain textual includes instead
+          find "$THEOS/sdks" "$THEOS/toolchain" \( -name 'module.map' -o -name 'module.modulemap' \) -print -delete | wc -l
+
+      - name: Check libc++ headers
+        run: |
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          CXXDIR="$THEOS/toolchain/linux/iphone/include/c++/v1"
+          if [ -f "$SDK/usr/include/c++/v1/vector" ]; then
+            echo "SDK libc++ headers found: using them (ABI of the iOS 7 libc++.dylib)"
+            echo "CXXINC=-nostdinc++ -isystem $SDK/usr/include/c++/v1" >> "$GITHUB_ENV"
+          else
+            echo "SDK has no libc++ headers: using the toolchain's ($CXXDIR)"
+            if [ ! -f "$CXXDIR/__config_site" ]; then
+              cat > "$CXXDIR/__config_site" <<'CFG'
+          #ifndef _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_ABI_VERSION 1
+          #define _LIBCPP_ABI_NAMESPACE __1
+          #define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+          #define _LIBCPP_PSTL_CPU_BACKEND_SERIAL 1
+          #define _LIBCPP_DISABLE_AVAILABILITY 1
+          #endif
+          CFG
+            fi
+            echo "CXXINC=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Fetch sources (wrapper + C++ translation, SDL2)
         run: |
           git clone --recursive --depth 1 https://github.com/zaps166/NFSIISE wrapper
           test -s wrapper/src/Cpp/NFS2SE.cpp
           git clone --depth 1 --branch "$SDL_TAG" https://github.com/libsdl-org/SDL sdl
-          git clone --depth 1 https://github.com/theos/sdks theos-sdks
-          ls theos-sdks
-          SDK=$(ls -d theos-sdks/iPhoneOS9.3.sdk theos-sdks/iPhoneOS10.3.sdk theos-sdks/iPhoneOS10.*.sdk theos-sdks/iPhoneOS11.*.sdk 2>/dev/null | head -n1)
-          echo "Using SDK: $SDK"
-          echo "SDK=$GITHUB_WORKSPACE/$SDK" >> "$GITHUB_ENV"
 
       - name: Patch wrapper for iOS
         working-directory: wrapper/src
@@ -199,6 +237,9 @@ jobs:
 
       - name: Build SDL2 (static, armv7, iOS)
         run: |
+          for t in clang clang++ ld install_name_tool libtool lipo otool; do
+            printf '%-18s' "$t"; command -v $t || echo "MISSING"
+          done
           cat > ios.toolchain.cmake <<EOF
           set(CMAKE_SYSTEM_NAME iOS)
           set(CMAKE_OSX_ARCHITECTURES armv7)
@@ -207,9 +248,8 @@ jobs:
           set(CMAKE_C_COMPILER clang)
           set(CMAKE_CXX_COMPILER clang++)
           set(CMAKE_OBJC_COMPILER clang)
-          set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fuse-ld=lld")
-          set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fobjc-arc")
-          set(CMAKE_LIBTOOL /usr/lib/llvm-$LLVM/bin/llvm-libtool-darwin)
+          set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules")
+          set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fobjc-arc")
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
           cmake -S sdl -B sdl-build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/ios.toolchain.cmake \
@@ -224,19 +264,25 @@ jobs:
         run: |
           set -e
           OUT=$GITHUB_WORKSPACE/obj; mkdir -p $OUT
-          T="-target armv7-apple-ios$IOS_MIN -isysroot $SDK -O3 -DNDEBUG -I$GITHUB_WORKSPACE/sdl-out/include -I$GITHUB_WORKSPACE/compat"
+          # safety net from the BStone workflow: no strd/ldrd/ldm on possibly unaligned addresses
+          echo 'typedef struct{short a;int b;int c;}F; void st(char*p,short a,int b,int c){F f={a,b,c};*(F*)p=f;}' > /tmp/probe.c
+          MA=""
+          if clang -target armv7-apple-ios$IOS_MIN -isysroot $SDK -O2 -mllvm -arm-assume-misaligned-load-store -c /tmp/probe.c -o /tmp/probe.o 2>/dev/null; then
+            MA="-mllvm -arm-assume-misaligned-load-store"
+          fi
+          echo "misaligned flag: '$MA'"
+          T="-target armv7-apple-ios$IOS_MIN -isysroot $SDK -O2 -DNDEBUG -fno-modules -fno-strict-aliasing $MA -Wno-error -w -I$GITHUB_WORKSPACE/sdl-out/include -I$GITHUB_WORKSPACE/compat"
           echo "== C++ (translated game)"
-          clang++ $T -std=c++14 -stdlib=libc++ -fno-rtti -fno-exceptions -Wno-c++11-narrowing \
+          clang++ $T -std=gnu++14 -stdlib=libc++ $CXXINC -fno-cxx-modules -fno-rtti -fno-exceptions \
             -include $GITHUB_WORKSPACE/compat/ios_compat.h -c Cpp/NFS2SE.cpp -o $OUT/NFS2SE.o
           for f in DInput EAcsnd FetchTrackRecords Glide2x Kernel32 Timer User32 WinMM Wrapper Wsock32; do
             echo "== C $f"
-            clang $T -std=gnu89 -DGLES2 -DNFS_CPP -DIOS_BUILD -Wno-int-conversion \
-              -Wno-incompatible-function-pointer-types -c $f.c -o $OUT/$f.o
+            clang $T -std=gnu89 -DGLES2 -DNFS_CPP -DIOS_BUILD -c $f.c -o $OUT/$f.o
           done
           echo "== ObjC overlay"
           clang $T -std=gnu99 -fobjc-arc -DIOS_BUILD -x objective-c -c IOSOverlay.m -o $OUT/IOSOverlay.o
           echo "== link"
-          clang++ -target armv7-apple-ios$IOS_MIN -isysroot $SDK -stdlib=libc++ -fuse-ld=lld \
+          clang++ -target armv7-apple-ios$IOS_MIN -isysroot $SDK -stdlib=libc++ \
             -o $OUT/nfs2se $OUT/*.o $GITHUB_WORKSPACE/sdl-out/lib/libSDL2.a \
             -framework UIKit -framework Foundation -framework OpenGLES -framework QuartzCore \
             -framework CoreGraphics -framework AudioToolbox -framework CoreAudio -framework AVFoundation \

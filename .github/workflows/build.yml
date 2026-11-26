@@ -191,6 +191,12 @@ jobs:
           - (void)up   { pushKey(self.btn, 0); self.alpha = 0.40; }
           @end
 
+          @implementation AVAudioSession (NFSCompat)
+          - (BOOL)setCategory:(NSString *)category mode:(NSString *)mode options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError {
+            return [self setCategory:category withOptions:options error:outError];
+          }
+          @end
+
           static NSMutableArray *g_buttons;
           @interface NFSToggle : NSObject
           + (void)toggle:(UIButton *)sender;
@@ -245,6 +251,18 @@ jobs:
           for t in clang clang++ ld install_name_tool libtool lipo otool; do
             printf '%-18s' "$t"; command -v $t || echo "MISSING"
           done
+          mkdir -p compat
+          cat > compat/av_compat.h <<'AVH'
+          #ifdef __OBJC__
+          #import <AVFoundation/AVFoundation.h>
+          // SDL 2.30 uses iOS 9/10 audio-session APIs that the iPhoneOS 9.3 SDK does not declare.
+          #define AVAudioSessionCategoryOptionAllowBluetoothA2DP ((AVAudioSessionCategoryOptions)0)
+          #define AVAudioSessionCategoryOptionAllowAirPlay ((AVAudioSessionCategoryOptions)0)
+          @interface AVAudioSession (NFSCompat)
+          - (BOOL)setCategory:(NSString *)category mode:(NSString *)mode options:(AVAudioSessionCategoryOptions)options error:(NSError **)outError;
+          @end
+          #endif
+          AVH
           cat > ios.toolchain.cmake <<EOF
           set(CMAKE_SYSTEM_NAME iOS)
           set(CMAKE_OSX_ARCHITECTURES armv7)
@@ -255,13 +273,14 @@ jobs:
           set(CMAKE_OBJC_COMPILER clang)
           set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules")
           set(CMAKE_CXX_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fno-cxx-modules -stdlib=libc++ $CXXINC")
-          set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fobjc-arc")
+          set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fobjc-arc -include $PWD/compat/av_compat.h")
           set(CMAKE_AR $THEOS/toolchain/linux/iphone/bin/llvm-ar CACHE FILEPATH "")
           set(CMAKE_RANLIB $THEOS/toolchain/linux/iphone/bin/llvm-ranlib CACHE FILEPATH "")
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
           cmake -S sdl -B sdl-build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$PWD/ios.toolchain.cmake \
             -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DSDL_TESTS=OFF \
+            -DSDL_HIDAPI=OFF -DSDL_HIDAPI_JOYSTICK=OFF -DSDL_HIDAPI_LIBUSB=OFF \
             -DCMAKE_INSTALL_PREFIX=$PWD/sdl-out -DCMAKE_BUILD_TYPE=Release
           cmake --build sdl-build
           cmake --install sdl-build
@@ -288,7 +307,7 @@ jobs:
             clang $T -std=gnu89 -DGLES2 -DNFS_CPP -DIOS_BUILD -c $f.c -o $OUT/$f.o
           done
           echo "== ObjC overlay"
-          clang $T -std=gnu99 -fobjc-arc -DIOS_BUILD -x objective-c -c IOSOverlay.m -o $OUT/IOSOverlay.o
+          clang $T -std=gnu99 -fobjc-arc -DIOS_BUILD -include $GITHUB_WORKSPACE/compat/av_compat.h -x objective-c -c IOSOverlay.m -o $OUT/IOSOverlay.o
           echo "== link"
           clang++ -target armv7-apple-ios$IOS_MIN -isysroot $SDK -stdlib=libc++ \
             -o $OUT/nfs2se $OUT/*.o $GITHUB_WORKSPACE/sdl-out/lib/libSDL2.a \

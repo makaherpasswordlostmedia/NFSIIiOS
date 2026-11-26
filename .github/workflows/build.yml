@@ -254,6 +254,7 @@ jobs:
           set(CMAKE_CXX_COMPILER clang++)
           set(CMAKE_OBJC_COMPILER clang)
           set(CMAKE_C_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules")
+          set(CMAKE_CXX_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fno-cxx-modules -stdlib=libc++ $CXXINC")
           set(CMAKE_OBJC_FLAGS_INIT "-target armv7-apple-ios$IOS_MIN -fno-modules -fobjc-arc")
           set(CMAKE_AR $THEOS/toolchain/linux/iphone/bin/llvm-ar CACHE FILEPATH "")
           set(CMAKE_RANLIB $THEOS/toolchain/linux/iphone/bin/llvm-ranlib CACHE FILEPATH "")
